@@ -1,9 +1,9 @@
 {
-  "train_accuracy": 0.6184563398412358,
-  "test_accuracy": 0.5623811905952977,
-  "train_samples": 37288,
+  "train_accuracy": 0.5749478414379714,
+  "test_accuracy": 0.5772886443221611,
+  "train_samples": 37386,
   "test_samples": 9995,
-  "n_features": 65,
+  "n_features": 72,
   "feature_cols": [
     "spread",
     "rsi",
@@ -21,6 +21,8 @@
     "ema_21",
     "ema_cross_bull",
     "ema_cross_bear",
+    "ema_20",
+    "ema_50",
     "returns_1",
     "returns_5",
     "returns_20",
@@ -40,8 +42,10 @@
     "ll_count_5",
     "hour",
     "weekday",
-    "london_session",
-    "ny_session",
+    "london_session_sin",
+    "london_session_cos",
+    "ny_session_sin",
+    "ny_session_cos",
     "swing_high",
     "swing_low",
     "swing_high_level",
@@ -68,23 +72,26 @@
     "h1_bb_lower",
     "h1_macd",
     "h1_macd_signal",
+    "h1_ema_20",
+    "h1_ema_50",
     "h1_ob",
-    "h1_market_structure"
+    "h1_market_structure",
+    "h1_ema20_distance"
   ],
   "hyperparameters": {
-    "max_depth": 3,
-    "learning_rate": 0.09267540013088804,
-    "n_estimators": 150,
-    "min_child_weight": 4,
-    "gamma": 0.2256600951546719,
-    "subsample": 0.6252087185015206,
-    "colsample_bytree": 0.922018677846522,
-    "reg_alpha": 0.20995864159546518,
-    "reg_lambda": 0.678502306990324
+    "max_depth": 4,
+    "learning_rate": 0.01330539035859225,
+    "n_estimators": 200,
+    "min_child_weight": 3,
+    "gamma": 0.28144237852729953,
+    "subsample": 0.7393397638758212,
+    "colsample_bytree": 0.9851099978169261,
+    "reg_alpha": 0.011816850310017002,
+    "reg_lambda": 1.9874993067719284
   },
   "class_distribution_train": {
-    "SELL": 18644,
-    "BUY": 18644
+    "SELL": 18693,
+    "BUY": 18693
   },
   "model_type": "binary_classification"
 }

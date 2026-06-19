@@ -53,6 +53,7 @@ class FeatureEngineer:
         df = self.calculate_macd(df)
         df = self.calculate_bollinger_bands(df)
         df = self.calculate_ema_crossover(df)
+        df = self.calculate_emas(df)
         df = self.calculate_volume_features(df)
         
         if include_ml_features:
@@ -357,6 +358,20 @@ class FeatureEngineer:
         logger.debug(f"EMA crossover calculated ({fast_period}/{slow_period})")
         return df
     
+    def calculate_emas(
+        self,
+        df: pl.DataFrame,
+    ) -> pl.DataFrame:
+        """
+        Calculate standard EMAs for H1 reference (ema_20, ema_50).
+        """
+        df = df.with_columns([
+            pl.col("close").ewm_mean(span=20, adjust=False).alias("ema_20"),
+            pl.col("close").ewm_mean(span=50, adjust=False).alias("ema_50"),
+        ])
+        logger.debug("EMA 20/50 calculated")
+        return df
+    
     def calculate_volume_features(
         self,
         df: pl.DataFrame,
@@ -579,18 +594,43 @@ class FeatureEngineer:
         
         # Time-based features (if datetime column exists)
         if "time" in df.columns and df["time"].dtype == pl.Datetime:
+            # 1. Hitung raw minutes (gunakan -1 jika di luar sesi)
             df = df.with_columns([
                 pl.col("time").dt.hour().alias("hour"),
                 pl.col("time").dt.weekday().alias("weekday"),
                 
-                # Trading session indicators
-                ((pl.col("time").dt.hour() >= 8) & (pl.col("time").dt.hour() < 16))
-                    .cast(pl.Int8)
-                    .alias("london_session"),
-                ((pl.col("time").dt.hour() >= 13) & (pl.col("time").dt.hour() < 21))
-                    .cast(pl.Int8)
-                    .alias("ny_session"),
+                pl.when((pl.col("time").dt.hour() >= 8) & (pl.col("time").dt.hour() < 16))
+                  .then((pl.col("time").dt.hour() - 8) * 60 + pl.col("time").dt.minute())
+                  .otherwise(-1).cast(pl.Float64).alias("london_minutes"),
+                  
+                pl.when((pl.col("time").dt.hour() >= 13) & (pl.col("time").dt.hour() < 21))
+                  .then((pl.col("time").dt.hour() - 13) * 60 + pl.col("time").dt.minute())
+                  .otherwise(-1).cast(pl.Float64).alias("ny_minutes"),
             ])
+            
+            # 2. Cyclical Encoding (Sine/Cosine Transformation)
+            df = df.with_columns([
+                # London cycle (period = 60 minutes)
+                pl.when(pl.col("london_minutes") >= 0)
+                  .then((2 * np.pi * pl.col("london_minutes") / 60).sin())
+                  .otherwise(0.0).alias("london_session_sin"),
+                  
+                pl.when(pl.col("london_minutes") >= 0)
+                  .then((2 * np.pi * pl.col("london_minutes") / 60).cos())
+                  .otherwise(0.0).alias("london_session_cos"),
+                
+                # NY cycle (period = 60 minutes)
+                pl.when(pl.col("ny_minutes") >= 0)
+                  .then((2 * np.pi * pl.col("ny_minutes") / 60).sin())
+                  .otherwise(0.0).alias("ny_session_sin"),
+                  
+                pl.when(pl.col("ny_minutes") >= 0)
+                  .then((2 * np.pi * pl.col("ny_minutes") / 60).cos())
+                  .otherwise(0.0).alias("ny_session_cos"),
+            ])
+            
+            # 3. Hapus raw minutes untuk memaksakan model memakai sin/cos
+            df = df.drop(["london_minutes", "ny_minutes"])
         
         # Drop temporary columns
         df = df.drop(["_sma_20"])

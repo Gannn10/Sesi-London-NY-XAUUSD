@@ -31,15 +31,42 @@ class RegimeDetector:
         # Gunakan N candle terakhir agar cepat dan relevan
         data = df.tail(self.lookback).copy()
 
-        # Ekstrak fitur: Log Return & High-Low Range (Volatility)
+        # Ekstrak fitur dasar
         data['log_return'] = np.log(data['close'] / data['close'].shift(1)).fillna(0) + np.random.normal(0, 1e-6, len(data))
         data['range'] = ((data['high'] - data['low']) / data['close']).fillna(0) + np.random.normal(0, 1e-6, len(data))
+        
+        # Ekstrak Autocorrelation dari log_return
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            data['autocorr'] = data['log_return'].rolling(window=14, min_periods=14).apply(
+                lambda x: pd.Series(x).autocorr(lag=1)
+            ).fillna(0) + np.random.normal(0, 1e-6, len(data))
+
+        # Ekstrak ADX secara manual (window 14)
+        data['up_move'] = data['high'] - data['high'].shift(1)
+        data['down_move'] = data['low'].shift(1) - data['low']
+        data['plus_dm'] = np.where((data['up_move'] > data['down_move']) & (data['up_move'] > 0), data['up_move'], 0)
+        data['minus_dm'] = np.where((data['down_move'] > data['up_move']) & (data['down_move'] > 0), data['down_move'], 0)
+        
+        data['tr1'] = data['high'] - data['low']
+        data['tr2'] = (data['high'] - data['close'].shift(1)).abs()
+        data['tr3'] = (data['low'] - data['close'].shift(1)).abs()
+        data['tr'] = data[['tr1', 'tr2', 'tr3']].max(axis=1)
+        
+        tr14 = data['tr'].rolling(window=14, min_periods=1).sum()
+        plus_di14 = 100 * (data['plus_dm'].rolling(window=14, min_periods=1).sum() / tr14).fillna(0)
+        minus_di14 = 100 * (data['minus_dm'].rolling(window=14, min_periods=1).sum() / tr14).fillna(0)
+        
+        dx = 100 * (abs(plus_di14 - minus_di14) / (plus_di14 + minus_di14 + 1e-8))
+        data['adx'] = dx.rolling(window=14, min_periods=1).mean().fillna(0) + np.random.normal(0, 1e-6, len(data))
+
         data = data.dropna()
 
         if len(data) < self.n_states:
             return "UNKNOWN"
 
-        X = data[['log_return', 'range']].values
+        X = data[['log_return', 'range', 'adx', 'autocorr']].values
 
         try:
             # Fit & Predict

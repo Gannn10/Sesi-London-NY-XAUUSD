@@ -97,49 +97,90 @@ def cek_posisi_terbuka():
     positions = mt5.positions_get(symbol=cfg.SYMBOL, magic=cfg.MAGIC_NUMBER)
     return len(positions) > 0 if positions else False
 
-def terapkan_smart_breakeven():
-    """
-    Pindahkan SL ke titik Entry (BEP) jika posisi sudah running profit minimal 15 pips.
-    1 pip di XAUUSD biasanya $0.1 (jika harga 2000.10) atau $1.
-    Tergantung broker, kita akan pakai standar +150 point (15 pips).
-    """
+def terapkan_smart_exits(regime, rsi, harga_close):
     positions = mt5.positions_get(symbol=cfg.SYMBOL)
-    if positions is None:
+    if positions is None or len(positions) == 0:
         return
 
     for pos in positions:
         if pos.magic == cfg.MAGIC_NUMBER:
+            tick = mt5.symbol_info_tick(cfg.SYMBOL)
+            if tick is None: continue
+            
+            # --- 1. RSI EXIT ---
+            # Jika Buy, harga di atas entry (profit), dan RSI Overbought (> 75) -> Close
+            if pos.type == mt5.ORDER_TYPE_BUY and tick.bid > pos.price_open and rsi >= 75:
+                logger.info(f"[SMART EXIT] RSI Overbought ({rsi:.1f}). Menutup posisi BUY #{pos.ticket} untuk amankan profit.")
+                close_position(pos, tick.bid)
+                continue
+                
+            # Jika Sell, harga di bawah entry (profit), dan RSI Oversold (< 25) -> Close
+            elif pos.type == mt5.ORDER_TYPE_SELL and tick.ask < pos.price_open and rsi <= 25:
+                logger.info(f"[SMART EXIT] RSI Oversold ({rsi:.1f}). Menutup posisi SELL #{pos.ticket} untuk amankan profit.")
+                close_position(pos, tick.ask)
+                continue
+                
+            # --- 2. REGIME EXIT ---
+            # Jika market berubah jadi Choppy dan posisi sedang profit -> Close
+            profit_usd = 0.0
             if pos.type == mt5.ORDER_TYPE_BUY:
-                tick = mt5.symbol_info_tick(cfg.SYMBOL)
-                if tick is None: continue
-                profit_points = (tick.bid - pos.price_open) / mt5.symbol_info(cfg.SYMBOL).point
+                profit_usd = tick.bid - pos.price_open
+            else:
+                profit_usd = pos.price_open - tick.ask
                 
-                if profit_points >= 1500 and (pos.sl == 0.0 or pos.sl < pos.price_open):
-                    request = {
-                        "action": mt5.TRADE_ACTION_SLTP,
-                        "position": pos.ticket,
-                        "sl": pos.price_open,
-                        "tp": pos.tp
-                    }
-                    res = mt5.order_send(request)
-                    if res.retcode == mt5.TRADE_RETCODE_DONE:
+            if regime == "CHOPPY" and profit_usd >= 1.0: # Profit minimal $1.00 (10 pips XAUUSD)
+                logger.info(f"[SMART EXIT] Market menjadi CHOPPY. Menutup posisi #{pos.ticket} untuk amankan profit (${profit_usd:.2f}).")
+                close_position(pos, tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask)
+                continue
+
+            # --- 3. DYNAMIC TRAILING STOP (Step Trailing) ---
+            # Jika profit >= $3.00 (30 pips), trailing stop = harga_sekarang - $1.50
+            # Jika profit >= $1.50 (15 pips), SL digeser ke Breakeven
+            if pos.type == mt5.ORDER_TYPE_BUY:
+                if profit_usd >= 3.0: # 30 pips
+                    new_sl = tick.bid - 1.50
+                    if pos.sl == 0.0 or new_sl > pos.sl:
+                        modify_sl(pos, new_sl)
+                        logger.info(f"[TRAILING STOP] SL BUY #{pos.ticket} digeser ke {new_sl:.2f}")
+                elif profit_usd >= 1.50: # 15 pips
+                    if pos.sl == 0.0 or pos.sl < pos.price_open:
+                        modify_sl(pos, pos.price_open)
                         logger.info(f"[SMART BE] Posisi BUY #{pos.ticket} diamankan di BEP.")
-                        
             elif pos.type == mt5.ORDER_TYPE_SELL:
-                tick = mt5.symbol_info_tick(cfg.SYMBOL)
-                if tick is None: continue
-                profit_points = (pos.price_open - tick.ask) / mt5.symbol_info(cfg.SYMBOL).point
-                
-                if profit_points >= 1500 and (pos.sl == 0.0 or pos.sl > pos.price_open):
-                    request = {
-                        "action": mt5.TRADE_ACTION_SLTP,
-                        "position": pos.ticket,
-                        "sl": pos.price_open,
-                        "tp": pos.tp
-                    }
-                    res = mt5.order_send(request)
-                    if res.retcode == mt5.TRADE_RETCODE_DONE:
+                if profit_usd >= 3.0: # 30 pips
+                    new_sl = tick.ask + 1.50
+                    if pos.sl == 0.0 or new_sl < pos.sl:
+                        modify_sl(pos, new_sl)
+                        logger.info(f"[TRAILING STOP] SL SELL #{pos.ticket} digeser ke {new_sl:.2f}")
+                elif profit_usd >= 1.50: # 15 pips
+                    if pos.sl == 0.0 or pos.sl > pos.price_open:
+                        modify_sl(pos, pos.price_open)
                         logger.info(f"[SMART BE] Posisi SELL #{pos.ticket} diamankan di BEP.")
+
+def close_position(pos, price):
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": cfg.SYMBOL,
+        "volume": pos.volume,
+        "type": mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY,
+        "position": pos.ticket,
+        "price": price,
+        "deviation": cfg.DEVIATION,
+        "magic": cfg.MAGIC_NUMBER,
+        "comment": "Smart Exit",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+    mt5.order_send(request)
+
+def modify_sl(pos, new_sl):
+    request = {
+        "action": mt5.TRADE_ACTION_SLTP,
+        "position": pos.ticket,
+        "sl": new_sl,
+        "tp": pos.tp
+    }
+    mt5.order_send(request)
 
 def kirim_notion(tanggal):
     token = getattr(cfg, 'NOTION_TOKEN', '')
@@ -250,11 +291,22 @@ def extract_live_features(df_m5_pd, df_h1_pd):
     h1_subset = df_h1.select(h1_feature_cols)
     h1_subset = h1_subset.rename({c: f"h1_{c}" for c in h1_feature_cols if c != "time"})
     
+    # FIX: Shift H1 time forward by 1 hour to prevent look-ahead bias (Data Leakage)
+    h1_subset = h1_subset.with_columns(
+        (pl.col("time") + pl.duration(hours=1)).alias("time")
+    )
+    
     df = df.join_asof(
         h1_subset,
         on="time",
         strategy="backward"
     )
+    
+    # Calculate H1 derived features (must match train_ml_v3.py)
+    if "h1_close" in df.columns and "h1_ema_20" in df.columns:
+        df = df.with_columns([
+            ((pl.col("h1_close") - pl.col("h1_ema_20")) / pl.col("h1_ema_20")).alias("h1_ema20_distance")
+        ])
     
     df = df.fill_null(strategy="forward").fill_null(strategy="zero")
     return df.to_pandas()
@@ -317,14 +369,11 @@ def main():
             time.sleep(60 * 15)
             continue
             
-        if loss_beruntun >= cfg.MAX_LOSS_BERUNTUN:
-            logger.info(f"Loss beruntun {loss_beruntun}x. Pause {cfg.PAUSE_SETELAH_LOSS} menit.")
-            time.sleep(cfg.PAUSE_SETELAH_LOSS * 60)
-            loss_beruntun = 0
-            continue
-
-        # Eksekusi Smart Breakeven
-        terapkan_smart_breakeven()
+        # if loss_beruntun >= cfg.MAX_LOSS_BERUNTUN:
+        #     logger.info(f"Loss beruntun {loss_beruntun}x. Pause {cfg.PAUSE_SETELAH_LOSS} menit.")
+        #     time.sleep(cfg.PAUSE_SETELAH_LOSS * 60)
+        #     loss_beruntun = 0
+        #     continue
 
         # Ambil data untuk mengevaluasi harga saat ini (live)
         # Kita butuh minimal 200 candle untuk EMA_200 dsb
@@ -338,10 +387,6 @@ def main():
             
         # HMM Regime Detector
         regime = detect_market_regime(df_m5_pd)
-        if regime == "CHOPPY":
-            logger.info("Market CHOPPY (Sideways). Skip eksekusi order.")
-            time.sleep(60) # Wait 1 minute before checking again
-            continue
             
         try:
             # 1. Ekstrak fitur menggunakan Polars
@@ -352,6 +397,7 @@ def main():
             # Prediksi dilakukan di candle berjalan (index -1)
             current_features = df_features.iloc[[-1]]
             harga_close = float(current_features['close'].iloc[0])
+            rsi = float(current_features['rsi'].iloc[0]) if 'rsi' in current_features.columns else 50.0
             
             # 3. Prediksi dengan XGBoost
             X_live = current_features[feature_cols]
@@ -369,6 +415,14 @@ def main():
         except Exception as e:
             logger.error(f"Error saat komputasi AI/Feature: {e}")
             time.sleep(10)
+            continue
+            
+        # Eksekusi Smart Exits (termasuk BEP, Trailing Stop, RSI Exit, Regime Exit)
+        terapkan_smart_exits(regime, rsi, harga_close)
+        
+        if regime == "CHOPPY":
+            # Jangan spam log setiap loop, cukup tunggu
+            time.sleep(60) # Wait 1 minute before checking again
             continue
             
         # Logging

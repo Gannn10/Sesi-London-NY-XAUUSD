@@ -74,11 +74,11 @@ class MLTrainerV3:
         self.smc = SMCAnalyzer()
 
         # Triple barrier for BINARY classification (BUY vs SELL only)
-        # Symmetric barriers for balanced labeling
+        # Symmetric barriers for balanced RR (1:1)
         self.labeler = TripleBarrierLabeling(
             profit_atr_mult=0.5,     # 50% ATR profit target
-            stoploss_atr_mult=0.5,   # 50% ATR stop loss (symmetric RR 1.0)
-            max_holding_bars=20,     # 5 hours on M15 (allow time to develop)
+            stoploss_atr_mult=0.5,   # 50% ATR stop loss
+            max_holding_bars=20,     # max 20 bars holding
         )
 
         self.model = None
@@ -204,6 +204,11 @@ class MLTrainerV3:
         rename_map = {c: f"h1_{c}" for c in df_h1_selected.columns if c != "time"}
         rename_map["time"] = "time"  # Keep time for join
         df_h1_selected = df_h1_selected.rename(rename_map)
+
+        # FIX: Shift H1 time forward by 1 hour to prevent look-ahead bias (Data Leakage)
+        df_h1_selected = df_h1_selected.with_columns(
+            (pl.col("time") + pl.duration(hours=1)).alias("time")
+        )
 
         # Asof join (each M15 bar gets H1 features from the latest H1 bar)
         df_joined = df_m15.join_asof(
