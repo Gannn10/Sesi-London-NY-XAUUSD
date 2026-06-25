@@ -70,3 +70,7 @@ LOG_BACKUP_COUNT = 1   # Berapa hari log lama yang ingin disimpan (1 = simpan lo
 # ── NOTION INTEGRATION ─────────────────────────────────────
 NOTION_TOKEN         = os.getenv("NOTION_TOKEN", "")  # Diambil dari file .env
 NOTION_DATABASE_ID   = os.getenv("NOTION_DATABASE_ID", "") # Diambil dari file .env
+
+# ── AI THRESHOLD & FILTER ──────────────────────────────────
+AI_CONFIDENCE_THRESHOLD = 0.53      # XGBoost V3 probability maxes out ~54-55%. Turunkan dari 0.60 agar bisa entry.
+USE_SWEEP_FILTER        = False     # False = Agresif (Murni sinyal AI), True = Sabar (Wajib ada Liquidity Sweep)

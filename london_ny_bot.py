@@ -284,7 +284,7 @@ def extract_live_features(df_m5_pd, df_h1_pd):
     h1_feature_cols = [
         "time", "close", "rsi", "atr", "bb_upper", "bb_lower",
         "macd", "macd_signal", "ema_20", "ema_50",
-        "ob", "fvg", "market_structure"
+        "ob", "fvg", "market_structure", "last_swing_high", "last_swing_low"
     ]
     h1_feature_cols = [c for c in h1_feature_cols if c in df_h1.columns]
     
@@ -329,7 +329,7 @@ def main():
             model_data = pickle.load(f)
         xgb_model = model_data['xgb_model']
         feature_cols = model_data['feature_names']
-        confidence_threshold = model_data.get('confidence_threshold', 0.60)
+        confidence_threshold = getattr(cfg, 'AI_CONFIDENCE_THRESHOLD', model_data.get('confidence_threshold', 0.60))
         logger.info(f"✅ AI Model V3 Loaded! Threshold: {confidence_threshold*100:.1f}%")
         logger.info(f" Fitur yang digunakan: {len(feature_cols)} kolom")
     except Exception as e:
@@ -346,6 +346,7 @@ def main():
     tanggal_terakhir = datetime.now(wib).date()
     last_log_time = None
     last_active_ticket = None
+    last_signal_time = None  # Menyimpan waktu candle terakhir yang memicu OP
 
     while True:
         sekarang_wib = datetime.now(wib)
@@ -385,31 +386,57 @@ def main():
             time.sleep(5)
             continue
             
-        # HMM Regime Detector
-        regime = detect_market_regime(df_m5_pd)
+        # HMM Regime Detector (menggunakan candle yang sudah close saja / index[:-1])
+        regime = detect_market_regime(df_m5_pd.iloc[:-1])
             
         try:
             # 1. Ekstrak fitur menggunakan Polars
             df_features = extract_live_features(df_m5_pd, df_h1_pd)
             
-            # 2. Ambil data terbaru (candle terakhir yang sudah close adalah index -2 jika index -1 masih berjalan,
-            # TAPI karena bot MT5 mengambil sampai live tick, index -1 adalah candle live)
-            # Prediksi dilakukan di candle berjalan (index -1)
-            current_features = df_features.iloc[[-1]]
-            harga_close = float(current_features['close'].iloc[0])
-            rsi = float(current_features['rsi'].iloc[0]) if 'rsi' in current_features.columns else 50.0
+            # 2. Arsitektur Hybrid (XGBoost di candle closed, Eksekusi di candle live)
+            closed_features = df_features.iloc[[-2]]
+            live_features = df_features.iloc[[-1]]
             
-            # 3. Prediksi dengan XGBoost
-            X_live = current_features[feature_cols]
-            dmatrix_live = xgb.DMatrix(X_live)
+            waktu_candle = closed_features['time'].iloc[0]  # Waktu candle tertutup
+            harga_close = float(live_features['close'].iloc[0]) # Harga eksekusi/live
+            rsi = float(live_features['rsi'].iloc[0]) if 'rsi' in live_features.columns else 50.0
             
-            prob_buy = float(xgb_model.predict(dmatrix_live)[0])
+            # --- TAHAP 1: Liquidity Sweep Filter (Lookback 10 Candle) ---
+            recent_features = df_features.tail(10)
+            
+            last_swing_low = float(live_features['last_swing_low'].iloc[0]) if 'last_swing_low' in live_features.columns else None
+            last_swing_high = float(live_features['last_swing_high'].iloc[0]) if 'last_swing_high' in live_features.columns else None
+            
+            # Cek opsi di config, apakah filter ini mau dipakai atau dibypass (murni AI)
+            use_sweep_filter = getattr(cfg, 'USE_SWEEP_FILTER', True)
+            
+            is_buy_allowed = not use_sweep_filter  # Jika False, default ke True (bypass)
+            is_sell_allowed = not use_sweep_filter
+            
+            if use_sweep_filter:
+                if last_swing_low is not None and not pd.isna(last_swing_low):
+                    # Cari apakah ada candle di 10 candle terakhir yang low-nya tembus swing low, tapi close-nya mantul naik
+                    sweep_buy_df = recent_features[(recent_features['low'] < recent_features['last_swing_low']) & (recent_features['close'] > recent_features['last_swing_low'])]
+                    if len(sweep_buy_df) > 0:
+                        is_buy_allowed = True
+                        
+                if last_swing_high is not None and not pd.isna(last_swing_high):
+                    # Cari apakah ada candle di 10 candle terakhir yang high-nya tembus swing high, tapi close-nya mantul turun
+                    sweep_sell_df = recent_features[(recent_features['high'] > recent_features['last_swing_high']) & (recent_features['close'] < recent_features['last_swing_high'])]
+                    if len(sweep_sell_df) > 0:
+                        is_sell_allowed = True
+            
+            # 3. Prediksi dengan XGBoost (menggunakan fitur closed candle)
+            X_closed = closed_features[feature_cols]
+            dmatrix_closed = xgb.DMatrix(X_closed)
+            
+            prob_buy = float(xgb_model.predict(dmatrix_closed)[0])
             prob_sell = 1.0 - prob_buy
             
             signal_buy = prob_buy >= confidence_threshold
             signal_sell = prob_sell >= confidence_threshold
             
-            atr = float(current_features['atr'].iloc[0]) if 'atr' in current_features.columns else 3.0
+            atr = float(live_features['atr'].iloc[0]) if 'atr' in live_features.columns else 3.0
             multiplier = get_tp_sl_multiplier(mode)
 
         except Exception as e:
@@ -481,55 +508,89 @@ def main():
 
         # Eksekusi Order
         if not ada_posisi:
-            if signal_buy or signal_sell:
-                strategy_name = "AI_BUY" if signal_buy else "AI_SELL"
-                logger.info(f"[🔥] SINYAL {strategy_name} AI TERDETEKSI! Confidence: {max(prob_buy, prob_sell)*100:.1f}%")
+            # --- FUNNEL LOGGING (Catat Sinyal AI yg Diblokir Filter) ---
+            if (signal_buy and not is_buy_allowed) and (waktu_candle != last_signal_time):
+                logger.info(f"[BLOCKED] AI prediksi BUY ({prob_buy*100:.1f}%), tapi DIBLOKIR oleh Liquidity Sweep Filter (tidak ada sweep di 10 candle terakhir).")
+                last_signal_time = waktu_candle # Supaya tidak spam
                 
-                if signal_buy:
-                    ask = mt5.symbol_info_tick(cfg.SYMBOL).ask
-                    sl = ask - (atr * multiplier['sl'])
-                    tp = ask + (atr * multiplier['tp'])
-                    order_type = mt5.ORDER_TYPE_BUY
-                    price = ask
-                    prob = prob_buy
-                else:
-                    bid = mt5.symbol_info_tick(cfg.SYMBOL).bid
-                    sl = bid + (atr * multiplier['sl'])
-                    tp = bid - (atr * multiplier['tp'])
-                    order_type = mt5.ORDER_TYPE_SELL
-                    price = bid
-                    prob = prob_sell
-                    
-                # Kelly Position Scaler
-                lot_size = cfg.LOT_SIZE
-                if prob > 0.85:
-                    lot_size = cfg.LOT_SIZE * 3
-                    logger.info(f"💎 High Conviction! Prob {prob*100:.1f}% > 85%, Lot x3 -> {lot_size}")
-                elif prob > 0.70:
-                    lot_size = cfg.LOT_SIZE * 2
-                    logger.info(f"🚀 Medium Conviction! Prob {prob*100:.1f}% > 70%, Lot x2 -> {lot_size}")
-                    
-                request = {
-                    "action": mt5.TRADE_ACTION_DEAL,
-                    "symbol": cfg.SYMBOL,
-                    "volume": lot_size,
-                    "type": order_type,
-                    "price": price,
-                    "sl": sl,
-                    "tp": tp,
-                    "deviation": cfg.DEVIATION,
-                    "magic": cfg.MAGIC_NUMBER,
-                    "comment": f"{strategy_name} {mode}",
-                    "type_time": mt5.ORDER_TIME_GTC,
-                    "type_filling": mt5.ORDER_FILLING_IOC,
-                }
+            if (signal_sell and not is_sell_allowed) and (waktu_candle != last_signal_time):
+                logger.info(f"[BLOCKED] AI prediksi SELL ({prob_sell*100:.1f}%), tapi DIBLOKIR oleh Liquidity Sweep Filter (tidak ada sweep di 10 candle terakhir).")
+                last_signal_time = waktu_candle # Supaya tidak spam
                 
-                result = mt5.order_send(request)
-                if result.retcode != mt5.TRADE_RETCODE_DONE:
-                    logger.error(f"Order {strategy_name} gagal: {result.retcode}")
-                else:
-                    logger.info(f"ORDER BERHASIL! Tiket #{result.order} | TP: {tp:.2f} | SL: {sl:.2f}")
-                    trade_count += 1
+            # Menggabungkan Signal ML dan Izin dari Sweep Filter
+            if (signal_buy and is_buy_allowed) or (signal_sell and is_sell_allowed):
+                if waktu_candle != last_signal_time:
+                    strategy_name = "AI_BUY+SWEEP" if signal_buy else "AI_SELL+SWEEP"
+                    logger.info(f"[🔥] SINYAL {strategy_name} TERDETEKSI! Confidence: {max(prob_buy, prob_sell)*100:.1f}%")
+                
+                    if signal_buy:
+                        ask = mt5.symbol_info_tick(cfg.SYMBOL).ask
+                        order_type = mt5.ORDER_TYPE_BUY
+                        price = ask
+                        prob = prob_buy
+                        
+                        # --- Dynamic SL ---
+                        sl_statik = ask - (atr * multiplier['sl'])
+                        sl_dynamic = (last_swing_low - (0.3 * atr)) if last_swing_low and not pd.isna(last_swing_low) else sl_statik
+                        sl = min(sl_statik, sl_dynamic)  # Pilih yang lebih protektif (rendah)
+                        
+                        # --- Dynamic TP ---
+                        tp_statik = ask + (atr * multiplier['tp'])
+                        h1_swing_high = float(live_features['h1_last_swing_high'].iloc[0]) if 'h1_last_swing_high' in live_features.columns else None
+                        if h1_swing_high and not pd.isna(h1_swing_high) and h1_swing_high > ask:
+                            tp = h1_swing_high
+                        else:
+                            tp = tp_statik
+                    else:
+                        bid = mt5.symbol_info_tick(cfg.SYMBOL).bid
+                        order_type = mt5.ORDER_TYPE_SELL
+                        price = bid
+                        prob = prob_sell
+                        
+                        # --- Dynamic SL ---
+                        sl_statik = bid + (atr * multiplier['sl'])
+                        sl_dynamic = (last_swing_high + (0.3 * atr)) if last_swing_high and not pd.isna(last_swing_high) else sl_statik
+                        sl = max(sl_statik, sl_dynamic)  # Pilih yang lebih protektif (tinggi)
+                        
+                        # --- Dynamic TP ---
+                        tp_statik = bid - (atr * multiplier['tp'])
+                        h1_swing_low = float(live_features['h1_last_swing_low'].iloc[0]) if 'h1_last_swing_low' in live_features.columns else None
+                        if h1_swing_low and not pd.isna(h1_swing_low) and h1_swing_low < bid:
+                            tp = h1_swing_low
+                        else:
+                            tp = tp_statik
+                        
+                    # Kelly Position Scaler
+                    lot_size = cfg.LOT_SIZE
+                    if prob > 0.85:
+                        lot_size = cfg.LOT_SIZE * 3
+                        logger.info(f"💎 High Conviction! Prob {prob*100:.1f}% > 85%, Lot x3 -> {lot_size}")
+                    elif prob > 0.70:
+                        lot_size = cfg.LOT_SIZE * 2
+                        logger.info(f"🚀 Medium Conviction! Prob {prob*100:.1f}% > 70%, Lot x2 -> {lot_size}")
+                        
+                    request = {
+                        "action": mt5.TRADE_ACTION_DEAL,
+                        "symbol": cfg.SYMBOL,
+                        "volume": lot_size,
+                        "type": order_type,
+                        "price": price,
+                        "sl": sl,
+                        "tp": tp,
+                        "deviation": cfg.DEVIATION,
+                        "magic": cfg.MAGIC_NUMBER,
+                        "comment": f"{strategy_name} {mode}",
+                        "type_time": mt5.ORDER_TIME_GTC,
+                        "type_filling": mt5.ORDER_FILLING_IOC,
+                    }
+                    
+                    result = mt5.order_send(request)
+                    if result.retcode != mt5.TRADE_RETCODE_DONE:
+                        logger.error(f"Order {strategy_name} gagal: {result.retcode}")
+                    else:
+                        logger.info(f"ORDER BERHASIL! Tiket #{result.order} | TP: {tp:.2f} | SL: {sl:.2f}")
+                        trade_count += 1
+                        last_signal_time = waktu_candle  # Catat waktu candle agar tidak OP lagi di candle yang sama
                         
         time.sleep(2)
 
