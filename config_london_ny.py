@@ -5,11 +5,13 @@ import MetaTrader5 as mt5
 load_dotenv()
 
 # ── CORE ──────────────────────────────────────────────────
-SYMBOL          = "XAUUSDm"
+SYMBOL          = "XAUUSDc"
 TIMEFRAME       = mt5.TIMEFRAME_M5
-LOT_SIZE        = 0.01
+LOT_SIZE        = 0.02
 MAGIC_NUMBER    = 999222             # BEDA dari Asia bot (888111)!
 DEVIATION       = 20
+STRATEGY_MODE   = "HYBRID"           # Pilihan: "AI_SCALPER", "REVERSAL_SNIPER", atau "HYBRID"
+MAX_POSITIONS   = 3                  # Maksimal jumlah Open Posisi bersamaan
 
 # ── EMA ────────────────────────────────────────────────────
 EMA_FAST        = 50
@@ -19,6 +21,7 @@ NUM_CANDLES     = 250                # Harus > EMA_SLOW
 # ── BOLLINGER BANDS ────────────────────────────────────────
 BB_PERIOD       = 20
 BB_STD_DEV      = 2.0
+BB_STD_DEV_EXTREME = 2.5             # Khusus Mode Sniper Pucuk/Lembah
 BB_WIDTH_MIN    = 1.0                # MINIMUM (kebalikan dari Asia bot)
                                      # Naikkan → lebih selektif
                                      # Turunkan → lebih banyak sinyal
@@ -30,6 +33,8 @@ RSI_BULL_MIN    = 52                 # RSI harus > ini untuk BUY Breakout
 RSI_BEAR_MAX    = 48                 # RSI harus < ini untuk SELL Breakout
 RSI_OVERBOUGHT  = 60                 # RSI harus > ini untuk SELL Reversal (Pucuk)
 RSI_OVERSOLD    = 40                 # RSI harus < ini untuk BUY Reversal (Lembah)
+RSI_OVERBOUGHT_EXTREME = 70          # Sniper Pucuk
+RSI_OVERSOLD_EXTREME   = 30          # Sniper Lembah
 
 # ── ASIA RANGE ─────────────────────────────────────────────
 ASIA_RANGE_START     = 7            # Jam WIB mulai hitung range Asia
@@ -72,5 +77,7 @@ NOTION_TOKEN         = os.getenv("NOTION_TOKEN", "")  # Diambil dari file .env
 NOTION_DATABASE_ID   = os.getenv("NOTION_DATABASE_ID", "") # Diambil dari file .env
 
 # ── AI THRESHOLD & FILTER ──────────────────────────────────
-AI_CONFIDENCE_THRESHOLD = 0.53      # XGBoost V3 probability maxes out ~54-55%. Turunkan dari 0.60 agar bisa entry.
+AI_CONFIDENCE_THRESHOLD = 0.60      # Dikembalikan ke 0.60 agar entry lebih valid dan aman
 USE_SWEEP_FILTER        = False     # False = Agresif (Murni sinyal AI), True = Sabar (Wajib ada Liquidity Sweep)
+USE_MOMENTUM_FILTER     = True      # True = Mencegah OP melawan arah saat candle bergerak terlalu kencang (Anti-Pisau Jatuh)
+USE_TREND_FILTER        = True      # True = Hanya OP searah dengan trend besar (EMA 200)

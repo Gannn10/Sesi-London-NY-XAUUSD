@@ -55,6 +55,7 @@ class FeatureEngineer:
         df = self.calculate_ema_crossover(df)
         df = self.calculate_emas(df)
         df = self.calculate_volume_features(df)
+        df = self.calculate_momentum_features(df)
         
         if include_ml_features:
             df = self.calculate_ml_features(df)
@@ -675,6 +676,62 @@ class FeatureEngineer:
         df = df.drop(["_future_close"])
         
         logger.debug(f"Target created (lookahead={lookahead}, threshold={threshold})")
+        return df
+    
+    def calculate_momentum_features(self, df: pl.DataFrame) -> pl.DataFrame:
+        """
+        Calculate momentum and volatility regime features.
+        These help the model distinguish normal dips from crashes.
+        
+        Features:
+        - momentum_3c: Price change over last 3 candles (normalized by ATR)
+        - momentum_6c: Price change over last 6 candles (normalized by ATR)
+        - atr_ratio: Current ATR / Rolling mean ATR(20) — detects volatility spikes
+        - consecutive_direction: Count of consecutive up/down candles
+        - body_ratio: Candle body size relative to ATR (detects strong momentum candles)
+        """
+        # Momentum: price change normalized by ATR
+        if 'atr' in df.columns:
+            df = df.with_columns([
+                # Momentum 3 candle
+                ((pl.col('close') - pl.col('close').shift(3)) / pl.col('atr'))
+                    .fill_nan(0.0).fill_null(0.0).alias('momentum_3c'),
+                
+                # Momentum 6 candle
+                ((pl.col('close') - pl.col('close').shift(6)) / pl.col('atr'))
+                    .fill_nan(0.0).fill_null(0.0).alias('momentum_6c'),
+                
+                # ATR ratio: current ATR vs rolling mean ATR (volatility spike detector)
+                (pl.col('atr') / pl.col('atr').rolling_mean(window_size=20))
+                    .fill_nan(1.0).fill_null(1.0).alias('atr_ratio'),
+                
+                # Body ratio: candle body size / ATR (strong momentum candle detector)
+                ((pl.col('close') - pl.col('open')).abs() / pl.col('atr'))
+                    .fill_nan(0.0).fill_null(0.0).alias('body_ratio'),
+            ])
+        
+        # Consecutive direction: count of consecutive bullish/bearish candles
+        # Positive = consecutive green, Negative = consecutive red
+        is_bullish = (pl.col('close') > pl.col('open')).cast(pl.Int8)
+        
+        # We compute this via numpy for simplicity (polars doesn't have a native streak function)
+        closes = df['close'].to_numpy()
+        opens = df['open'].to_numpy()
+        consec = np.zeros(len(df), dtype=np.float64)
+        
+        for i in range(1, len(df)):
+            if closes[i] > opens[i]:  # Bullish
+                consec[i] = max(consec[i-1], 0) + 1
+            elif closes[i] < opens[i]:  # Bearish
+                consec[i] = min(consec[i-1], 0) - 1
+            else:
+                consec[i] = 0
+        
+        df = df.with_columns([
+            pl.Series('consecutive_direction', consec)
+        ])
+        
+        logger.debug("Momentum features calculated (momentum_3c, momentum_6c, atr_ratio, body_ratio, consecutive_direction)")
         return df
     
     def get_feature_columns(self, df: pl.DataFrame) -> List[str]:
